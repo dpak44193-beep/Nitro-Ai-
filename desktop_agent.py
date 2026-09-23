@@ -29,6 +29,7 @@ from browser_intelligence import BrowserIntelligence
 from real_observer import RealObserver
 from tanglish_nlp import IntentActionMapper, TanglishNormalizer
 from verification_engine import VerificationEngine
+from workflow_orchestrator import WorkflowOrchestrator
 
 try:
     import pyttsx3  # type: ignore
@@ -404,6 +405,7 @@ class LocalInstructionAgent:
         os.makedirs(self.capture_dir, exist_ok=True)
         self.observer = RealObserver(self.capture_dir)
         self.browser = BrowserIntelligence(browser_name="edge", headless=False, timeout=10000)
+        self.workflow_orchestrator = WorkflowOrchestrator()
         self.verification_engine = VerificationEngine(self.observer)
         self.screen_access_active = False
         self.screen_context_path: Optional[str] = None
@@ -521,6 +523,25 @@ class LocalInstructionAgent:
     def browser_verify(self, expected: Dict[str, Any]) -> Dict[str, Any]:
         return self.browser.verify(expected)
 
+    def browser_new_tab(self, url: Optional[str] = None) -> Dict[str, Any]:
+        return self.browser.new_tab(url)
+
+    def browser_tabs(self) -> Dict[str, Any]:
+        return self.browser.list_tabs()
+
+    def browser_select_tab(self, index: int) -> Dict[str, Any]:
+        return self.browser.select_tab(index)
+
+    def browser_close_tab(self, index: Optional[int] = None) -> Dict[str, Any]:
+        return self.browser.close_tab(index)
+
+    def browser_download(self, url: str, filename: Optional[str] = None, directory: Optional[str] = None) -> Dict[str, Any]:
+        return self.browser.download_file(url, filename, directory)
+
+    def plan_workflow(self, request: str) -> Dict[str, Any]:
+        """Classify a long request and return required steps or clarification questions."""
+        return self.workflow_orchestrator.plan(request)
+
     def speak(self, text: str) -> Dict[str, Any]:
         return self.voice.speak(text)
 
@@ -566,6 +587,14 @@ class LocalInstructionAgent:
     def execute_from_overlay(self, instruction: str) -> Dict[str, Any]:
         if not instruction or not instruction.strip():
             return {"status": "failed", "error": "empty instruction"}
+
+        workflow_plan = self.workflow_orchestrator.plan(instruction)
+        if workflow_plan.get("workflow"):
+            return {
+                "status": "workflow_ready" if workflow_plan.get("status") == "planned" else "clarification_required",
+                "message": workflow_plan.get("message"),
+                "workflow": workflow_plan,
+            }
 
         intent = self.tanglish_nlp.normalize(instruction)
         if intent.get("needs_clarification") or intent.get("intent") == "UNKNOWN":

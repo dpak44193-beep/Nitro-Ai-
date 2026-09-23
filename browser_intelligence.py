@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -63,6 +64,65 @@ class BrowserIntelligence:
 
     def _ensure_started(self) -> bool:
         return self.started and self.page is not None or self.start().get("status") in {"started", "already_running"}
+
+    def new_tab(self, url: Optional[str] = None) -> Dict[str, Any]:
+        if not self._ensure_started():
+            return {"status": "failed", "error": "browser_not_started"}
+        try:
+            page = self.context.new_page()
+            page.set_default_timeout(self.timeout)
+            if url:
+                page.goto(url if url.startswith(("http://", "https://")) else f"https://{url}", wait_until="domcontentloaded", timeout=self.timeout)
+            self.page = page
+            return {"status": "completed", "tab_index": self.context.pages.index(page), "url": page.url, "title": page.title()}
+        except Exception as exc:
+            return {"status": "failed", "error": str(exc)}
+
+    def list_tabs(self) -> Dict[str, Any]:
+        if not self._ensure_started():
+            return {"status": "failed", "error": "browser_not_started"}
+        return {
+            "status": "completed",
+            "active_index": self.context.pages.index(self.page),
+            "tabs": [{"index": index, "url": page.url, "title": page.title()} for index, page in enumerate(self.context.pages)],
+        }
+
+    def select_tab(self, index: int) -> Dict[str, Any]:
+        if not self._ensure_started():
+            return {"status": "failed", "error": "browser_not_started"}
+        pages = self.context.pages
+        if index < 0 or index >= len(pages):
+            return {"status": "failed", "error": f"tab_index_out_of_range:{index}"}
+        self.page = pages[index]
+        self.page.bring_to_front()
+        return {"status": "completed", "active_index": index, "url": self.page.url, "title": self.page.title()}
+
+    def close_tab(self, index: Optional[int] = None) -> Dict[str, Any]:
+        if not self._ensure_started():
+            return {"status": "failed", "error": "browser_not_started"}
+        pages = self.context.pages
+        target_index = self.context.pages.index(self.page) if index is None else index
+        if target_index < 0 or target_index >= len(pages):
+            return {"status": "failed", "error": f"tab_index_out_of_range:{target_index}"}
+        pages[target_index].close()
+        remaining = self.context.pages
+        self.page = remaining[-1] if remaining else None
+        return {"status": "completed", "closed_index": target_index, "remaining_tabs": len(remaining)}
+
+    def download_file(self, url: str, filename: Optional[str] = None, directory: Optional[str] = None) -> Dict[str, Any]:
+        if not self._ensure_started():
+            return {"status": "failed", "error": "browser_not_started"}
+        target_dir = Path(directory or (Path.home() / "Downloads"))
+        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with self.page.expect_download(timeout=self.timeout) as download_info:
+                self.page.goto(url if url.startswith(("http://", "https://")) else f"https://{url}")
+            download = download_info.value
+            target = target_dir / (filename or download.suggested_filename)
+            download.save_as(str(target))
+            return {"status": "completed", "path": str(target), "filename": target.name, "url": url}
+        except Exception as exc:
+            return {"status": "failed", "error": str(exc), "url": url}
 
     def navigate(self, url: str, wait_until: str = "domcontentloaded") -> Dict[str, Any]:
         if not self._ensure_started():
