@@ -4,6 +4,30 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 
+BROWSER_ACTIONS = {
+    "browser_open": {
+        "parameters": ["browser"],
+        "expected_state": ["window", "title"],
+    },
+    "browser_navigate": {
+        "parameters": ["url"],
+        "expected_state": ["url", "title"],
+    },
+    "browser_click": {
+        "parameters": ["element"],
+        "expected_state": ["url", "title", "text"],
+    },
+    "browser_fill": {
+        "parameters": ["field", "value"],
+        "expected_state": ["text"],
+    },
+    "browser_search": {
+        "parameters": ["query"],
+        "expected_state": ["url", "text"],
+    },
+}
+
+
 @dataclass
 class ExpectedState:
     """State that must be observed after an action."""

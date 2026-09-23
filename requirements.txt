@@ -53,3 +53,6 @@ llama-index==0.9.31
 
 # Optional: Logging & Monitoring
 python-json-logger==2.0.7
+
+# Browser intelligence
+playwright==1.55.0

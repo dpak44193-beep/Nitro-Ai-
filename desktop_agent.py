@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pyautogui
+from browser_intelligence import BrowserIntelligence
 from real_observer import RealObserver
 from tanglish_nlp import IntentActionMapper, TanglishNormalizer
 from verification_engine import VerificationEngine
@@ -402,6 +403,7 @@ class LocalInstructionAgent:
         self.capture_dir = os.path.join(os.getcwd(), "captures")
         os.makedirs(self.capture_dir, exist_ok=True)
         self.observer = RealObserver(self.capture_dir)
+        self.browser = BrowserIntelligence(browser_name="edge", headless=False, timeout=10000)
         self.verification_engine = VerificationEngine(self.observer)
         self.screen_access_active = False
         self.screen_context_path: Optional[str] = None
@@ -482,8 +484,42 @@ class LocalInstructionAgent:
             "voice_input_available": self.voice.recognizer is not None and self.voice.microphone is not None,
             "text_to_speech_available": self.voice.speaker is not None,
             "captures_dir": self.capture_dir,
+            "browser_started": self.browser.started,
             "execution_count": len(self.execution_log),
         }
+
+    def browser_start(self) -> Dict[str, Any]:
+        return self.browser.start()
+
+    def browser_navigate(self, url: str) -> Dict[str, Any]:
+        return self.browser.navigate(url)
+
+    def browser_state(self) -> Dict[str, Any]:
+        return self.browser.get_page_state()
+
+    def browser_snapshot(self) -> Dict[str, Any]:
+        return self.browser.get_dom_snapshot()
+
+    def browser_find_button(self, name: str) -> Dict[str, Any]:
+        return self.browser.find_button(name)
+
+    def browser_click_button(self, name: str) -> Dict[str, Any]:
+        return self.browser.click_button(name)
+
+    def browser_find_link(self, name: str) -> Dict[str, Any]:
+        return self.browser.find_link(name)
+
+    def browser_click_link(self, name: str) -> Dict[str, Any]:
+        return self.browser.click_link(name)
+
+    def browser_fill(self, target: str, value: str) -> Dict[str, Any]:
+        return self.browser.fill_input(target, value)
+
+    def browser_search(self, query: str) -> Dict[str, Any]:
+        return self.browser.search_google(query)
+
+    def browser_verify(self, expected: Dict[str, Any]) -> Dict[str, Any]:
+        return self.browser.verify(expected)
 
     def speak(self, text: str) -> Dict[str, Any]:
         return self.voice.speak(text)
