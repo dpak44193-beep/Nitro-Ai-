@@ -132,7 +132,7 @@ class WorkflowOrchestrator:
         if required == "three topics":
             return bool(re.search(r"topics?\s*[:=]\s*[^.;]+", lowered))
         if required in {"output file path", "summary file path", "output filename"}:
-            return bool(re.search(r"(?:save|write)\s+(?:it\s+)?(?:as|to)\s+\S+\.(?:txt|md|csv|json)", lowered))
+            return bool(re.search(r"(?:save|write|file)\s+(?:it\s+)?(?:as|to|at)\s+\S+\.(?:txt|md|csv|json)", lowered))
         if required in {"three public file urls", "five page urls"}:
             return len(re.findall(r"https?://", lowered)) >= (3 if required == "three public file urls" else 5)
         if required in {"tab order", "pinned tab", "duplicate tab", "filter criteria", "invalid and corrected values", "file contents", "information target"}:
