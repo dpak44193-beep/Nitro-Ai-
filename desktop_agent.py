@@ -30,6 +30,7 @@ from real_observer import RealObserver
 from tanglish_nlp import IntentActionMapper, TanglishNormalizer
 from verification_engine import VerificationEngine
 from workflow_orchestrator import WorkflowOrchestrator
+from voice_engine import SpeechRecognitionSTT, VoiceEngine, VoskSTT, WindowsTTS
 
 try:
     import pyttsx3  # type: ignore
@@ -269,8 +270,11 @@ class SimpleOverlay:
                     self._set_status("No voice command detected")
                     return result
                 self._set_status("Running voice command...")
-                command_result = self._command_handler(text)
-                self._set_status(f"Voice result: {command_result.get('status', 'unknown')}")
+                if result.get("execution") is not None:
+                    self._set_status(f"Voice result: {result['execution'].get('status', 'unknown')}")
+                else:
+                    command_result = self._command_handler(text)
+                    self._set_status(f"Voice result: {command_result.get('status', 'unknown')}")
                 return result
             finally:
                 self._set_status("Voice processing finished")
@@ -399,6 +403,8 @@ class LocalInstructionAgent:
         )
         self.guard = SentinelGuard(admin_mode=admin_mode)
         self.voice = VoiceInput()
+        self.voice_engine = self._create_voice_engine()
+        self.voice_engine.set_command_handler(self.execute_from_overlay)
         self.overlay = SimpleOverlay()
         self.execution_log: List[Dict[str, Any]] = []
         self.capture_dir = os.path.join(os.getcwd(), "captures")
@@ -484,11 +490,25 @@ class LocalInstructionAgent:
             "screen_context_path": self.screen_context_path,
             "local_model": self.local_model,
             "voice_input_available": self.voice.recognizer is not None and self.voice.microphone is not None,
+            "voice_engine_state": self.voice_engine.state,
+            "voice_provider": self.voice_engine.stt.__class__.__name__,
             "text_to_speech_available": self.voice.speaker is not None,
             "captures_dir": self.capture_dir,
             "browser_started": self.browser.started,
             "execution_count": len(self.execution_log),
         }
+
+    def _create_voice_engine(self) -> VoiceEngine:
+        model_path = os.environ.get("VOSK_MODEL_PATH", "").strip()
+        stt = None
+        if model_path and os.path.isdir(model_path):
+            try:
+                stt = VoskSTT(model_path)
+            except Exception:
+                stt = None
+        stt = stt or SpeechRecognitionSTT(self.voice)
+        tts = WindowsTTS(self.voice.speaker) if self.voice.speaker is not None else None
+        return VoiceEngine(stt=stt, tts=tts)
 
     def browser_start(self) -> Dict[str, Any]:
         return self.browser.start()
@@ -653,16 +673,13 @@ class LocalInstructionAgent:
 
     def execute_voice_command(self, timeout: int = 10) -> Dict[str, Any]:
         """Listen once and execute the recognized instruction through the guard."""
-        voice_result = self.listen_voice_command(timeout=timeout)
-        if voice_result.get("status") != "completed":
-            return voice_result
-
-        text = voice_result.get("text", "").strip()
-        if not text:
-            return {"status": "failed", "error": "no voice command detected"}
-
-        result = self.execute_from_overlay(text)
-        return {"status": result.get("status", "unknown"), "text": text, "result": result}
+        result = self.voice_engine.listen_and_execute()
+        return {
+            "status": result.get("status", "unknown"),
+            "text": result.get("transcript", ""),
+            "result": result.get("execution", result),
+            "voice": result,
+        }
 
     def take_screenshot(self, filename: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
         if not dry_run and not self.allow_desktop_control:
@@ -1145,11 +1162,13 @@ class LocalInstructionAgent:
 
     def live_voice_control(self, operation: str, command_handler=None, status_handler=None) -> Dict[str, Any]:
         if operation == "listen":
-            return self.listen_voice_command(timeout=10)
+            return self.voice_engine.listen_and_execute()
         if operation == "start_live":
-            return self.voice.start_live_listening(command_handler, status_handler)
+            if command_handler is not None:
+                self.voice_engine.set_command_handler(command_handler)
+            return self.voice_engine.start_live(status_handler)
         if operation == "stop_live":
-            return self.voice.stop_live_listening()
+            return self.voice_engine.stop()
         return {"status": "failed", "error": f"unknown live voice operation: {operation}"}
 
     def start_overlay(self):
