@@ -20,12 +20,13 @@ import subprocess
 import time
 import threading
 import webbrowser
+import queue
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pyautogui
 from real_observer import RealObserver
-from tanglish_nlp import TanglishNormalizer
+from tanglish_nlp import IntentActionMapper, TanglishNormalizer
 from verification_engine import VerificationEngine
 
 try:
@@ -147,22 +148,25 @@ class VoiceInput:
         self._stop_event.clear()
 
         def listen_loop():
-            while not self._stop_event.is_set():
-                result = self.listen_for_command(timeout=1)
-                if result.get("status") != "completed":
-                    continue
-                text = result.get("text", "").strip()
-                if not text:
-                    continue
-                if status_handler is not None:
-                    status_handler(f"Heard: {text}")
-                try:
-                    command_result = command_handler(text)
+            try:
+                while not self._stop_event.is_set():
+                    result = self.listen_for_command(timeout=1)
+                    if result.get("status") != "completed":
+                        continue
+                    text = result.get("text", "").strip()
+                    if not text:
+                        continue
                     if status_handler is not None:
-                        status_handler(f"Voice result: {command_result.get('status', 'unknown')}")
-                except Exception as exc:  # pragma: no cover
-                    if status_handler is not None:
-                        status_handler(f"Voice command error: {exc}")
+                        status_handler(f"Heard: {text}")
+                    try:
+                        command_result = command_handler(text)
+                        if status_handler is not None:
+                            status_handler(f"Voice result: {command_result.get('status', 'unknown')}")
+                    except Exception as exc:  # pragma: no cover
+                        if status_handler is not None:
+                            status_handler(f"Voice command error: {exc}")
+            finally:
+                self._listener_thread = None
 
         self._listener_thread = threading.Thread(target=listen_loop, daemon=True)
         self._listener_thread.start()
@@ -184,45 +188,97 @@ class SimpleOverlay:
         self._entry = None
         self._command_handler = None
         self._voice_handler = None
+        self._refresh_handler = None
+        self._status_queue = queue.Queue()
+        self._busy = False
+        self._busy_lock = threading.Lock()
 
-    def set_callbacks(self, command_handler=None, voice_handler=None):
+    def set_callbacks(self, command_handler=None, voice_handler=None, refresh_handler=None):
         self._command_handler = command_handler
         self._voice_handler = voice_handler
+        self._refresh_handler = refresh_handler
 
     def _set_status(self, message: str):
         if self._root is not None and self._status_var is not None:
-            self._status_var.set(message)
+            if threading.current_thread() is self._thread:
+                self._status_var.set(message)
+            else:
+                self._status_queue.put(message)
+
+    def _poll_status(self):
+        if self._root is None or not self._root.winfo_exists():
+            return
+        try:
+            while True:
+                self._status_var.set(self._status_queue.get_nowait())
+        except queue.Empty:
+            pass
+        self._root.after(100, self._poll_status)
+
+    def _run_background(self, status: str, task, on_success=None):
+        with self._busy_lock:
+            if self._busy:
+                self._set_status("Another command is still running")
+                return False
+            self._busy = True
+
+        self._set_status(status)
+
+        def worker():
+            try:
+                result = task()
+                if on_success is not None:
+                    on_success(result)
+            except Exception as exc:  # pragma: no cover
+                self._set_status(f"Error: {exc}")
+            finally:
+                with self._busy_lock:
+                    self._busy = False
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _refresh_from_overlay(self):
+        if self._refresh_handler is None:
+            self._set_status("Refresh is unavailable")
+            return
+
+        def completed(result):
+            status = result.get("status", "unknown")
+            self._set_status(f"Refresh: {status}")
+
+        self._run_background("Refreshing screen...", self._refresh_handler, completed)
 
     def _listen_from_overlay(self):
         if self._voice_handler is None:
             self._set_status("Voice input is unavailable")
             return
 
-        self._set_status("Listening...")
-        try:
-            self._root.attributes("-topmost", False)
-            result = self._voice_handler("listen", timeout=10)
-            if result.get("status") != "completed":
-                self._set_status(result.get("message", result.get("error", "Voice failed")))
-                return
+        def listen_task():
+            try:
+                result = self._voice_handler("listen", timeout=10)
+                if result.get("status") != "completed":
+                    self._set_status(result.get("message", result.get("error", "Voice failed")))
+                    return result
 
-            text = result.get("text", "").strip()
+                text = result.get("text", "").strip()
+                self._root.after(0, self._set_entry, text)
+                if not text or self._command_handler is None:
+                    self._set_status("No voice command detected")
+                    return result
+                self._set_status("Running voice command...")
+                command_result = self._command_handler(text)
+                self._set_status(f"Voice result: {command_result.get('status', 'unknown')}")
+                return result
+            finally:
+                self._set_status("Voice processing finished")
+
+        self._run_background("Listening...", listen_task)
+
+    def _set_entry(self, text: str):
+        if self._entry is not None:
             self._entry.delete(0, tk.END)
             self._entry.insert(0, text)
-            if not text:
-                self._set_status("No voice command detected")
-                return
-
-            self._set_status("Running voice command...")
-            if self._command_handler is None:
-                self._set_status("No command handler configured")
-                return
-            command_result = self._command_handler(text)
-            self._set_status(f"Voice result: {command_result.get('status', 'unknown')}")
-        except Exception as exc:  # pragma: no cover
-            self._set_status(f"Voice error: {exc}")
-        finally:
-            self._root.attributes("-topmost", True)
 
     def _start_live_voice_from_overlay(self):
         if self._voice_handler is None or self._command_handler is None:
@@ -246,17 +302,15 @@ class SimpleOverlay:
             self._set_status("Enter a command first")
             return
 
-        self._set_status("Running command...")
         if self._command_handler is not None:
-            try:
-                self._root.attributes("-topmost", False)
-                result = self._command_handler(text)
-                status = result.get("status", "unknown")
-                self._set_status(f"Result: {status}")
-            except Exception as exc:  # pragma: no cover
-                self._set_status(f"Error: {exc}")
-            finally:
-                self._root.attributes("-topmost", True)
+            def run_command():
+                return self._command_handler(text)
+
+            self._run_background(
+                "Running command...",
+                run_command,
+                lambda result: self._set_status(f"Result: {result.get('status', 'unknown')}"),
+            )
         else:
             self._set_status("No command handler configured")
 
@@ -294,6 +348,9 @@ class SimpleOverlay:
             run_btn = tk.Button(button_row, text="Run", fg="#111827", bg="#22c55e", command=self._run_from_overlay, width=12)
             run_btn.pack(side=tk.LEFT, padx=6)
 
+            refresh_btn = tk.Button(button_row, text="Refresh", fg="#111827", bg="#cbd5e1", command=self._refresh_from_overlay, width=12)
+            refresh_btn.pack(side=tk.LEFT, padx=6)
+
             listen_btn = tk.Button(button_row, text="Listen", fg="#111827", bg="#60a5fa", command=self._listen_from_overlay, width=12)
             listen_btn.pack(side=tk.LEFT, padx=6)
 
@@ -304,6 +361,7 @@ class SimpleOverlay:
             stop_btn = tk.Button(live_row, text="Stop", fg="white", bg="#ef4444", command=self._stop_live_voice_from_overlay, width=8)
             stop_btn.pack(side=tk.LEFT, padx=4)
 
+            root.after(100, self._poll_status)
             root.mainloop()
 
         self._thread = threading.Thread(target=run, daemon=True)
@@ -473,9 +531,51 @@ class LocalInstructionAgent:
         if not instruction or not instruction.strip():
             return {"status": "failed", "error": "empty instruction"}
 
-        result = self.execute_instruction(instruction, allow_desktop_control=True, consent=True)
+        intent = self.tanglish_nlp.normalize(instruction)
+        if intent.get("needs_clarification") or intent.get("intent") == "UNKNOWN":
+            return {
+                "status": "clarification_required",
+                "message": intent.get("clarification_reason", "Command is ambiguous"),
+                "intent": intent,
+            }
+
+        mapped = IntentActionMapper.to_action(intent)
+        if not mapped.get("action"):
+            return {
+                "status": "clarification_required",
+                "message": mapped.get("error", "Command cannot be mapped safely"),
+                "intent": intent,
+            }
+
+        canonical_instruction = self._intent_to_instruction(mapped)
+        result = self.execute_instruction(
+            canonical_instruction,
+            allow_desktop_control=True,
+            consent=True,
+        )
+        result["intent"] = intent
         self.speak(f"Command finished with status {result.get('status', 'unknown')}")
         return result
+
+    @staticmethod
+    def _intent_to_instruction(mapped: Dict[str, Any]) -> str:
+        action = mapped["action"]
+        data = mapped.get("input_data", {})
+        if action == "open_app":
+            return f"open {data.get('app', '')}"
+        if action == "search_web":
+            return f"search web {data.get('query', '')}"
+        if action == "type_text":
+            return f"type {data.get('text', '')}"
+        if action == "click_at":
+            return f"click at {data.get('x')} {data.get('y')}"
+        if action == "press_key":
+            return f"press {data.get('key', '')}"
+        if action == "wait":
+            return f"wait {data.get('seconds', 1)}"
+        if action == "take_screenshot":
+            return "take screenshot"
+        return ""
 
     def normalize_user_command(self, user_input: str) -> Dict[str, Any]:
         """Normalize English or Tanglish input without executing desktop actions."""
@@ -988,7 +1088,11 @@ class LocalInstructionAgent:
         return {"status": "failed", "error": f"unknown live voice operation: {operation}"}
 
     def start_overlay(self):
-        self.overlay.set_callbacks(command_handler=self.execute_from_overlay, voice_handler=self.live_voice_control)
+        self.overlay.set_callbacks(
+            command_handler=self.execute_from_overlay,
+            voice_handler=self.live_voice_control,
+            refresh_handler=self.refresh_screen_context,
+        )
         return self.overlay.start(command_handler=self.execute_from_overlay, voice_handler=self.live_voice_control)
 
 
