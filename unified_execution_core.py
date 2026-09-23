@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -11,6 +12,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from action_schema import ActionTool
+from desktop_control import DesktopControl, create_desktop_action
 from desktop_agent import LocalInstructionAgent
 from recovery_engine import RecoveryEngine
 from tanglish_nlp import IntentActionMapper, TanglishNormalizer
@@ -200,6 +202,7 @@ class UnifiedExecutionCore:
         self.identity = UnifiedIdentity(agent_id, agent_name, owner)
         self.permission_guard = PermissionGuard()
         self.desktop_agent = desktop_agent or LocalInstructionAgent(allow_desktop_control=True)
+        self.desktop_control = DesktopControl(desktop_agent=self.desktop_agent)
         self.observer = Observer()
         self.verifier = Verifier()
         self.memory = UnifiedMemory()
@@ -385,6 +388,89 @@ class UnifiedExecutionCore:
         )
         result["intent"] = intent
         return result
+
+    async def execute_desktop_action(
+        self,
+        category: str,
+        operation: str,
+        parameters: Optional[Dict[str, Any]] = None,
+        expected_state: Optional[Dict[str, Any]] = None,
+        risk_level: str = "low",
+        explicit_permission: bool = False,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Run one policy-controlled desktop action through the core lifecycle."""
+        action = create_desktop_action(category, operation, parameters, expected_state, risk_level)
+        action_name = f"{category}.{operation}"
+        context = {
+            "action_type": ActionType.DESKTOP_CONTROL.value,
+            "blast_radius": "high" if risk_level in {"high", "critical"} else "low",
+        }
+        allowed, reason, blast = self.permission_guard.evaluate(self.identity, action_name, context)
+        if not allowed:
+            self.audit.log(
+                self.identity.agent_id,
+                ExecutionPhase.AUTHORIZATION.value,
+                action_name,
+                "denied",
+                blast,
+                details=reason,
+            )
+            return {"status": "denied", "action_id": action.action_id, "reason": reason, "phase": ExecutionPhase.AUTHORIZATION.value}
+        self.audit.log(
+            self.identity.agent_id,
+            ExecutionPhase.AUTHORIZATION.value,
+            action_name,
+            "checking",
+            details=f"risk_level={risk_level}",
+        )
+        result = await asyncio.to_thread(
+            self.desktop_control.execute,
+            action,
+            explicit_permission,
+            dry_run,
+        )
+        observation = await self.observer.observe(result, action_name)
+        if observation["is_anomaly"]:
+            recovery = self.recovery.recover(
+                action=action_name,
+                input_data=parameters or {},
+                expected=expected_state or {},
+                failure_reason=result.get("error", result.get("reason", "desktop_action_failed")),
+                execution_id=action.action_id,
+                dry_run=dry_run,
+            )
+            return {"status": "failed", "action_id": action.action_id, "reason": "observation_failed", "recovery": recovery, "data": result}
+
+        verification: Dict[str, Any] = {"status": "VERIFIED", "expected_state": expected_state or {}, "verified_at": datetime.now().isoformat()}
+        if expected_state and not dry_run:
+            if category.lower() == "browser":
+                verification = await asyncio.to_thread(
+                    self.desktop_agent.browser_verify,
+                    expected_state,
+                )
+            elif category.lower() in {"windows", "apps", "keyboard", "mouse"}:
+                before_screen = self.desktop_agent.observer.screenshot("priority7_before")
+                verification = self.desktop_agent.verify_action(result, expected_state, before_screen).get("verification", {})
+            if verification.get("status") not in {"VERIFIED", "verified"}:
+                recovery = self.recovery.recover(
+                    action=action_name,
+                    input_data=parameters or {},
+                    expected=expected_state,
+                    failure_reason=verification.get("reason", "desktop_action_verification_failed"),
+                    execution_id=action.action_id,
+                    dry_run=dry_run,
+                )
+                return {"status": "failed", "action_id": action.action_id, "reason": "verification_failed", "verification": verification, "recovery": recovery}
+
+        self.audit.log(
+            self.identity.agent_id,
+            ExecutionPhase.COMPLETED.value,
+            action_name,
+            "completed",
+            details=json.dumps({"action_id": action.action_id, "verification": verification}, default=str),
+        )
+        return {"status": "completed", "action_id": action.action_id, "category": category, "operation": operation, "result": result, "verification": verification}
 
     @staticmethod
     def _action_to_instruction(action: str, data: Dict[str, Any]) -> Optional[str]:
