@@ -9,5 +9,6 @@ audit.db
 unified_memory.db
 unified_audit.db
 task_memory.db
+agent_learning.db
 .env
 .DS_Store

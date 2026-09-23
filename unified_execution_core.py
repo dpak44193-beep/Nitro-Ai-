@@ -15,6 +15,7 @@ from action_schema import ActionTool
 from desktop_control import DesktopControl, create_desktop_action
 from desktop_agent import LocalInstructionAgent
 from recovery_engine import RecoveryEngine
+from learning_engine import LearningEngine
 from task_memory import TaskMemory
 from tanglish_nlp import IntentActionMapper, TanglishNormalizer
 
@@ -208,6 +209,7 @@ class UnifiedExecutionCore:
         self.verifier = Verifier()
         self.memory = UnifiedMemory()
         self.task_memory = TaskMemory()
+        self.learning_engine = LearningEngine()
         self.audit = UnifiedAuditLog()
         self.recovery = RecoveryEngine(self.desktop_agent)
         self.execution_history: Dict[str, Dict[str, Any]] = {}
@@ -277,12 +279,54 @@ class UnifiedExecutionCore:
             self.audit.log(self.identity.agent_id, ExecutionPhase.COMPLETED.value, action, "completed", blast, input_data, result)
             self.task_memory.record_result(task_id, result, verification)
             self.task_memory.complete_task(task_id, "SUCCESS", "direct_execution")
+            self._learn_execution(
+                raw_input=context.get("raw_input", action),
+                normalized_intent=context.get("normalized_intent", action.upper()),
+                target=input_data.get("app") or input_data.get("query"),
+                result=result,
+                verification=verification,
+                final_status="SUCCESS",
+            )
             self.execution_history[execution_id] = {"execution_id": execution_id, "action": action, "result": result, "observation": observation, "verification": verification}
             return self._response(execution_id, "completed", "success", ExecutionPhase.COMPLETED, blast, data=result)
         except Exception as exc:
             self.task_memory.record_failure(task_id, {"reason": str(exc), "phase": ExecutionPhase.EXECUTION.value})
             self.task_memory.complete_task(task_id, "FAILED", "direct_execution")
+            self._learn_execution(
+                raw_input=context.get("raw_input", action),
+                normalized_intent=context.get("normalized_intent", action.upper()),
+                target=input_data.get("app") or input_data.get("query"),
+                result={},
+                verification={},
+                failure={"reason": str(exc)},
+                final_status="FAILED",
+            )
             return self._response(execution_id, "failed", str(exc), ExecutionPhase.FAILED, context["blast_radius"])
+
+    def _learn_execution(
+        self,
+        raw_input: str,
+        normalized_intent: str,
+        target: Optional[str],
+        result: Dict[str, Any],
+        verification: Dict[str, Any],
+        final_status: str,
+        failure: Optional[Dict[str, Any]] = None,
+        recovery: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Learn from outcomes only; this never changes source or policy."""
+        return self.learning_engine.learn_from_experience({
+            "raw_input": raw_input,
+            "normalized_intent": normalized_intent,
+            "target": target,
+            "plan": [],
+            "actions": [{"action": normalized_intent, "method": "verified_execution", "parameters": {}}],
+            "result": result,
+            "verification": verification,
+            "failure": failure or {},
+            "recovery": recovery or [],
+            "final_status": final_status,
+        })
 
     def _recovery_response(
         self,
@@ -299,9 +343,28 @@ class UnifiedExecutionCore:
             self.task_memory.record_recovery(task_id, recovery)
             if recovery.get("recovered"):
                 self.task_memory.complete_task(task_id, "RECOVERED", recovery.get("strategy", "recovery"))
+                self._learn_execution(
+                    raw_input=action,
+                    normalized_intent=action.upper(),
+                    target=input_data.get("app") or input_data.get("query"),
+                    result=result,
+                    verification=recovery.get("verification", {}),
+                    recovery=[recovery],
+                    final_status="RECOVERED",
+                )
             else:
                 self.task_memory.record_failure(task_id, {"reason": recovery.get("message", "recovery_failed"), "phase": ExecutionPhase.RECOVERY.value})
                 self.task_memory.complete_task(task_id, "FAILED", "recovery")
+                self._learn_execution(
+                    raw_input=action,
+                    normalized_intent=action.upper(),
+                    target=input_data.get("app") or input_data.get("query"),
+                    result=result,
+                    verification={},
+                    failure={"reason": recovery.get("message", "recovery_failed")},
+                    recovery=[recovery],
+                    final_status="FAILED",
+                )
         if recovery.get("recovered"):
             self.audit.log(
                 self.identity.agent_id,
@@ -405,10 +468,20 @@ class UnifiedExecutionCore:
         result = await self.execute_action(
             mapped["action"],
             mapped["input_data"],
-            context={"expected_outcome": mapped["expected_outcome"], "normalized_task": intent.get("normalized_input", user_input)},
+            context={
+                "expected_outcome": mapped["expected_outcome"],
+                "normalized_task": intent.get("normalized_input", user_input),
+                "raw_input": user_input,
+                "normalized_intent": intent.get("intent", "UNKNOWN"),
+            },
             dry_run=dry_run,
         )
         result["intent"] = intent
+        result["learned_skill"] = self.select_learned_skill(
+            user_input,
+            intent=intent.get("intent"),
+            target=intent.get("target") or intent.get("query"),
+        )
         return result
 
     def retrieve_task_memory(self, task: str) -> Dict[str, Any]:
@@ -421,6 +494,13 @@ class UnifiedExecutionCore:
             "has_previous_success": successful is not None,
             "has_previous_failures": bool(failures),
         }
+
+    def select_learned_skill(self, raw_input: str, intent: Optional[str] = None, target: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Return only promoted skills; callers must still execute through policy."""
+        return self.learning_engine.select_skill(raw_input, intent, target)
+
+    def list_learned_skills(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        return self.learning_engine.list_skills(status)
 
     async def execute_desktop_action(
         self,
@@ -519,6 +599,14 @@ class UnifiedExecutionCore:
         )
         self.task_memory.record_result(task_id, result, verification)
         self.task_memory.complete_task(task_id, "SUCCESS", f"{category}.{operation}")
+        self._learn_execution(
+            raw_input=action_name,
+            normalized_intent=action_name.upper(),
+            target=parameters.get("app") if parameters else None,
+            result=result,
+            verification=verification,
+            final_status="SUCCESS",
+        )
         return {"status": "completed", "action_id": action.action_id, "category": category, "operation": operation, "result": result, "verification": verification}
 
     @staticmethod
