@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 
 import pyautogui
 from browser_intelligence import BrowserIntelligence
+from event_bus import EventBus
 from real_observer import RealObserver
 from tanglish_nlp import IntentActionMapper, TanglishNormalizer
 from verification_engine import VerificationEngine
@@ -192,14 +193,16 @@ class SimpleOverlay:
         self._command_handler = None
         self._voice_handler = None
         self._refresh_handler = None
+        self._interrupt_handler = None
         self._status_queue = queue.Queue()
         self._busy = False
         self._busy_lock = threading.Lock()
 
-    def set_callbacks(self, command_handler=None, voice_handler=None, refresh_handler=None):
+    def set_callbacks(self, command_handler=None, voice_handler=None, refresh_handler=None, interrupt_handler=None):
         self._command_handler = command_handler
         self._voice_handler = voice_handler
         self._refresh_handler = refresh_handler
+        self._interrupt_handler = interrupt_handler
 
     def _set_status(self, message: str):
         if self._root is not None and self._status_var is not None:
@@ -207,6 +210,30 @@ class SimpleOverlay:
                 self._status_var.set(message)
             else:
                 self._status_queue.put(message)
+
+    def show_event(self, event: Dict[str, Any]) -> None:
+        name = event.get("event", "")
+        if name == "voice.transcript":
+            message = f"Listening: {event.get('text', '')[:48]}"
+        elif name == "voice.partial":
+            message = f"Heard: {event.get('text', '')[:48]}"
+        elif name == "voice.state":
+            message = f"Voice: {event.get('state', 'IDLE')}"
+        elif name == "intent.detected":
+            message = f"Thinking: {event.get('intent', 'UNKNOWN')}"
+        elif name == "task.started":
+            message = "Executing..."
+        elif name == "action.started":
+            message = f"Action: {event.get('action', 'unknown')}"
+        elif name == "action.completed":
+            message = f"Verified action: {event.get('action', 'unknown')}"
+        elif name == "task.interrupted":
+            message = "Stopped"
+        elif name == "task.completed":
+            message = "Ready"
+        else:
+            return
+        self._set_status(message)
 
     def _poll_status(self):
         if self._root is None or not self._root.winfo_exists():
@@ -294,6 +321,10 @@ class SimpleOverlay:
         self._set_status(f"Live voice: {result.get('status', 'unknown')}")
 
     def _stop_live_voice_from_overlay(self):
+        if self._interrupt_handler is not None:
+            result = self._interrupt_handler()
+            self._set_status(f"Stopped: {result.get('status', 'unknown')}")
+            return
         if self._voice_handler is None:
             return
         result = self._voice_handler("stop_live")
@@ -403,8 +434,11 @@ class LocalInstructionAgent:
         )
         self.guard = SentinelGuard(admin_mode=admin_mode)
         self.voice = VoiceInput()
+        self.events = EventBus()
+        self._interrupt_event = threading.Event()
         self.voice_engine = self._create_voice_engine()
         self.voice_engine.set_command_handler(self.execute_from_overlay)
+        self.voice_engine.set_event_handler(lambda name, payload: self.emit(name, **payload))
         self.overlay = SimpleOverlay()
         self.execution_log: List[Dict[str, Any]] = []
         self.capture_dir = os.path.join(os.getcwd(), "captures")
@@ -496,6 +530,7 @@ class LocalInstructionAgent:
             "captures_dir": self.capture_dir,
             "browser_started": self.browser.started,
             "execution_count": len(self.execution_log),
+            "agent_state": "INTERRUPTED" if self._interrupt_event.is_set() else "IDLE",
         }
 
     def _create_voice_engine(self) -> VoiceEngine:
@@ -565,6 +600,25 @@ class LocalInstructionAgent:
     def speak(self, text: str) -> Dict[str, Any]:
         return self.voice.speak(text)
 
+    def subscribe(self, event_name: str, listener) -> None:
+        self.events.subscribe(event_name, listener)
+
+    def emit(self, event_name: str, **payload: Any) -> None:
+        self.events.emit(event_name, payload)
+
+    def interrupt(self) -> Dict[str, Any]:
+        """Cooperatively stop the current workflow and release held input."""
+        self._interrupt_event.set()
+        try:
+            pyautogui.keyUp("shift")
+            pyautogui.keyUp("ctrl")
+            pyautogui.keyUp("alt")
+        except Exception:
+            pass
+        self.voice_engine.stop()
+        self.emit("task.interrupted", reason="user_stop")
+        return {"status": "interrupted", "message": "Current task stopped"}
+
     def verify_action(
         self,
         action_result: Dict[str, Any],
@@ -580,10 +634,12 @@ class LocalInstructionAgent:
                 "action_result": action_result,
             }
 
+        self.emit("verification.started", expected=expected)
         verification = self.verification_engine.verify(
             action=self._verification_action(expected, timeout),
             before_screen=before_screen,
         )
+        self.emit("verification.success" if verification["status"] == "VERIFIED" else "verification.failed", result=verification)
         return {
             "status": verification["status"],
             "action": action_result,
@@ -608,6 +664,11 @@ class LocalInstructionAgent:
         if not instruction or not instruction.strip():
             return {"status": "failed", "error": "empty instruction"}
 
+        if instruction.strip().lower() in {"stop", "cancel", "wait", "don't do that", "dont do that"}:
+            return self.interrupt()
+
+        self._interrupt_event.clear()
+        self.emit("voice.transcript", text=instruction)
         workflow_plan = self.workflow_orchestrator.plan(instruction)
         if workflow_plan.get("workflow"):
             return {
@@ -617,6 +678,7 @@ class LocalInstructionAgent:
             }
 
         intent = self.tanglish_nlp.normalize(instruction)
+        self.emit("intent.detected", intent=intent.get("intent"), target=intent.get("target"), query=intent.get("query"))
         if intent.get("needs_clarification") or intent.get("intent") == "UNKNOWN":
             return {
                 "status": "clarification_required",
@@ -754,6 +816,9 @@ class LocalInstructionAgent:
         if dry_run:
             return {"status": "dry_run", "action": "click", "x": x, "y": y, "clicks": clicks}
 
+        self.emit("mouse.move", x=x, y=y)
+        pyautogui.moveTo(x=x, y=y)
+        self.emit("mouse.click", x=x, y=y, clicks=clicks)
         pyautogui.click(x=x, y=y, clicks=clicks)
         self._log("click_at", "completed", {"x": x, "y": y, "clicks": clicks})
         return {"status": "completed", "x": x, "y": y}
@@ -765,6 +830,7 @@ class LocalInstructionAgent:
         if dry_run:
             return {"status": "dry_run", "message": f"Would type: {text}"}
 
+        self.emit("keyboard.typing", text=text, length=len(text))
         if any(ord(character) > 127 for character in text) and pyperclip is not None:
             pyperclip.copy(text)
             pyautogui.hotkey("ctrl", "v")
@@ -1120,11 +1186,16 @@ class LocalInstructionAgent:
 
         steps = self._try_local_model_plan(prompt) or self._split_steps(prompt)
         results = []
+        self.emit("task.started", instruction=prompt, step_count=len(steps))
 
         for step in steps:
+            if self._interrupt_event.is_set():
+                self.emit("task.interrupted", reason="user_stop")
+                return {"status": "interrupted", "results": results, "execution_log": self.execution_log[-10:]}
             try:
                 parsed = self.parse_instruction(step)
                 action = parsed["action"]
+                self.emit("action.started", action=action, instruction=step)
 
                 if action == "screenshot":
                     result = self.take_screenshot(dry_run=dry_run)
@@ -1148,14 +1219,17 @@ class LocalInstructionAgent:
                     result = {"status": "failed", "error": f"Unsupported action: {action}"}
 
                 results.append({"instruction": step, "result": result})
+                self.emit("action.completed", action=action, status=result.get("status"), result=result)
             except ValueError as exc:
                 results.append({"instruction": step, "result": {"status": "failed", "error": str(exc)}})
 
-        return {
+        response = {
             "status": "completed" if all(item["result"].get("status") in {"completed", "dry_run"} for item in results) else "partial",
             "results": results,
             "execution_log": self.execution_log[-10:],
         }
+        self.emit("task.completed", status=response["status"])
+        return response
 
     def listen_voice_command(self, timeout: int = 10) -> Dict[str, Any]:
         return self.voice.listen_for_command(timeout=timeout)
@@ -1172,10 +1246,12 @@ class LocalInstructionAgent:
         return {"status": "failed", "error": f"unknown live voice operation: {operation}"}
 
     def start_overlay(self):
+        self.subscribe("*", self.overlay.show_event)
         self.overlay.set_callbacks(
             command_handler=self.execute_from_overlay,
             voice_handler=self.live_voice_control,
             refresh_handler=self.refresh_screen_context,
+            interrupt_handler=self.interrupt,
         )
         return self.overlay.start(command_handler=self.execute_from_overlay, voice_handler=self.live_voice_control)
 

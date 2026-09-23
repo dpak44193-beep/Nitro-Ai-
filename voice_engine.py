@@ -128,17 +128,26 @@ class VoiceEngine:
         self.running = False
         self.last_transcript = ""
         self.command_handler: Optional[Callable[[str], Dict[str, Any]]] = None
+        self.event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     def set_command_handler(self, handler: Callable[[str], Dict[str, Any]]) -> None:
         self.command_handler = handler
 
+    def set_event_handler(self, handler: Callable[[str, Dict[str, Any]], None]) -> None:
+        self.event_handler = handler
+
+    def _emit(self, name: str, **payload: Any) -> None:
+        if self.event_handler:
+            self.event_handler(name, payload)
+
     def start(self) -> Dict[str, Any]:
         result = self.stt.start()
         if result.get("status") in {"ready", "started"}:
             self.running = True
             self.state = self.IDLE
+            self._emit("voice.state", state=self.state)
             return {"status": "started", "provider": result.get("provider"), "offline": result.get("offline", False)}
         return result
 
@@ -146,6 +155,7 @@ class VoiceEngine:
         self.running = False
         self._stop_event.set()
         self.state = self.IDLE
+        self._emit("voice.state", state=self.state)
         return self.stt.stop()
 
     def listen_and_execute(self) -> Dict[str, Any]:
@@ -156,24 +166,32 @@ class VoiceEngine:
             if started.get("status") != "started":
                 return started
         self.state = self.LISTENING
+        self._emit("voice.state", state=self.state)
         transcript = self.stt.listen_once()
         text = str(transcript.get("text", "")).strip()
         confidence = float(transcript.get("confidence", 0.0) or 0.0)
         self.last_transcript = text
+        self._emit("voice.partial", text=text, confidence=confidence)
         if transcript.get("status") != "completed" or not text:
             self.state = self.IDLE
+            self._emit("voice.state", state=self.state)
             return {"status": "failed", "error": transcript.get("error", "empty_transcript"), "transcript": text}
         if confidence < self.min_confidence:
             self.state = self.IDLE
+            self._emit("voice.clarification", text=text, confidence=confidence)
             return {"status": "clarification_required", "message": f"Did you say: {text}?", "transcript": text, "confidence": confidence}
         self.state = self.UNDERSTANDING
+        self._emit("voice.state", state=self.state)
         self.state = self.EXECUTING
+        self._emit("voice.state", state=self.state)
         result = self.command_handler(text)
         self.state = self.RESPONDING
+        self._emit("voice.state", state=self.state)
         response = self._response_for(result)
         if self.tts and response:
             self.tts.speak(response)
         self.state = self.IDLE
+        self._emit("voice.state", state=self.state)
         return {"status": "completed", "transcript": text, "confidence": confidence, "execution": result, "response": response}
 
     def start_live(self, status_handler: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
