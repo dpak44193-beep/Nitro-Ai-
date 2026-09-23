@@ -6,5 +6,7 @@ __pycache__/
 .ruff_cache/
 captures/
 audit.db
+unified_memory.db
+unified_audit.db
 .env
 .DS_Store

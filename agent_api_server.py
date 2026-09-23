@@ -17,6 +17,7 @@ from ai_agent_core import (
     setup_example_agent
 )
 from desktop_agent import LocalInstructionAgent
+from unified_execution_core import UnifiedExecutionCore
 
 # ============================================================================
 # REQUEST/RESPONSE MODELS
@@ -61,6 +62,12 @@ class DesktopInstructionRequest(BaseModel):
     access_token: str = "local-desktop-agent-token"
     consent: bool = True
 
+class UnifiedActionRequest(BaseModel):
+    action: str
+    input_data: Dict = {}
+    context: Dict = {}
+    dry_run: bool = False
+
 # ============================================================================
 # FASTAPI APPLICATION
 # ============================================================================
@@ -74,6 +81,20 @@ app = FastAPI(
 # Initialize agents
 agent = setup_example_agent()
 desktop_agent = LocalInstructionAgent(allow_desktop_control=True)
+unified_core = UnifiedExecutionCore(
+    "unified_local_agent_001",
+    "Unified Local Desktop Agent",
+    "local_user",
+    desktop_agent=desktop_agent,
+)
+unified_core.grant_local_consent()
+for _action in ("take_screenshot", "click_at", "type_text", "open_app", "press_key", "search_web"):
+    unified_core.grant_permission(_action, "execute")
+unified_core.add_policy({
+    "agent_id": "unified_local_agent_001",
+    "max_blast_radius": "medium",
+    "allows_critical": False,
+})
 
 # ============================================================================
 # MIDDLEWARE - REQUEST VALIDATION
@@ -396,6 +417,38 @@ async def desktop_vision(payload: Dict = Body({"filename": "screen.png"})):
         filename = "screen.png"
     path = os.path.join(desktop_agent.capture_dir, filename)
     return desktop_agent.analyze_screen(path)
+
+@app.get("/api/v1/unified/status")
+async def unified_status():
+    """Return the unified pipeline status and configured permissions."""
+    return {
+        "agent_id": unified_core.identity.agent_id,
+        "agent_name": unified_core.identity.agent_name,
+        "local_consent": unified_core.identity.local_consent,
+        "admin_mode": unified_core.identity.admin_mode,
+        "permissions": unified_core.identity.permissions,
+        "execution_count": len(unified_core.get_execution_history()),
+        "audit_event_count": len(unified_core.get_audit_trail()),
+        "pipeline": [
+            "authentication", "authorization", "validation", "execution",
+            "observation", "verification", "memory_store", "recovery",
+        ],
+    }
+
+@app.post("/api/v1/unified/execute")
+async def execute_unified_action(payload: UnifiedActionRequest):
+    """Execute one action through permission, observation and verification phases."""
+    return await unified_core.execute_action(
+        payload.action,
+        payload.input_data,
+        context=payload.context,
+        dry_run=payload.dry_run,
+    )
+
+@app.get("/api/v1/unified/audit")
+async def unified_audit():
+    """Return the unified execution audit trail."""
+    return {"events": unified_core.get_audit_trail()}
 
 # ============================================================================
 # HEALTH CHECK
