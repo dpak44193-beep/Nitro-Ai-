@@ -35,6 +35,8 @@ class DesktopAction:
     retry_policy: Dict[str, Any] = field(default_factory=lambda: {"max_retries": 1})
     risk_level: str = "low"
     requested_by: str = "local_user"
+    task_id: Optional[str] = None
+    correlation_id: Optional[str] = None
 
 
 class DesktopPolicy:
@@ -92,6 +94,8 @@ class DesktopAudit:
             "event_id": str(uuid.uuid4())[:16],
             "timestamp": datetime.now().isoformat(),
             "action_id": action.action_id,
+            "task_id": action.task_id,
+            "correlation_id": action.correlation_id,
             "category": action.category,
             "operation": action.operation,
             "risk_level": action.risk_level,
@@ -277,5 +281,5 @@ class DesktopControl:
         return operation() if operation else {"status": "failed", "error": f"unsupported_browser_operation:{action.operation}"}
 
 
-def create_desktop_action(category: str, operation: str, parameters: Optional[Dict[str, Any]] = None, expected_state: Optional[Dict[str, Any]] = None, risk_level: str = "low") -> DesktopAction:
-    return DesktopAction(str(uuid.uuid4())[:16], category, operation, parameters or {}, expected_state or {}, risk_level=risk_level)
+def create_desktop_action(category: str, operation: str, parameters: Optional[Dict[str, Any]] = None, expected_state: Optional[Dict[str, Any]] = None, risk_level: str = "low", task_id: Optional[str] = None, correlation_id: Optional[str] = None) -> DesktopAction:
+    return DesktopAction(str(uuid.uuid4())[:16], category, operation, parameters or {}, expected_state or {}, risk_level=risk_level, task_id=task_id, correlation_id=correlation_id)

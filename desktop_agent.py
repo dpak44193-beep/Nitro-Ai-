@@ -21,6 +21,7 @@ import time
 import threading
 import webbrowser
 import queue
+import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -32,6 +33,7 @@ from tanglish_nlp import IntentActionMapper, TanglishNormalizer
 from verification_engine import VerificationEngine
 from workflow_orchestrator import WorkflowOrchestrator
 from voice_engine import SpeechRecognitionSTT, VoiceEngine, VoskSTT, WindowsTTS
+from runtime_context import RuntimeContext
 
 try:
     import pyttsx3  # type: ignore
@@ -435,6 +437,9 @@ class LocalInstructionAgent:
         self.guard = SentinelGuard(admin_mode=admin_mode)
         self.voice = VoiceInput()
         self.events = EventBus()
+        self.session_id = f"session_{uuid.uuid4().hex[:12]}"
+        self.runtime_context = RuntimeContext(session_id=self.session_id)
+        self.events.set_context(session_id=self.session_id)
         self._interrupt_event = threading.Event()
         self.voice_engine = self._create_voice_engine()
         self.voice_engine.set_command_handler(self.execute_from_overlay)
@@ -531,6 +536,7 @@ class LocalInstructionAgent:
             "browser_started": self.browser.started,
             "execution_count": len(self.execution_log),
             "agent_state": "INTERRUPTED" if self._interrupt_event.is_set() else "IDLE",
+            "runtime_context": self.runtime_context.to_dict(),
         }
 
     def _create_voice_engine(self) -> VoiceEngine:
@@ -606,9 +612,13 @@ class LocalInstructionAgent:
     def emit(self, event_name: str, **payload: Any) -> None:
         self.events.emit(event_name, payload)
 
+    def get_runtime_context(self) -> Dict[str, Any]:
+        return self.runtime_context.to_dict()
+
     def interrupt(self) -> Dict[str, Any]:
         """Cooperatively stop the current workflow and release held input."""
         self._interrupt_event.set()
+        self.runtime_context.update(agent_state="INTERRUPTED", interruption_state="requested")
         try:
             pyautogui.keyUp("shift")
             pyautogui.keyUp("ctrl")
@@ -668,6 +678,11 @@ class LocalInstructionAgent:
             return self.interrupt()
 
         self._interrupt_event.clear()
+        task_id = f"task_{uuid.uuid4().hex[:12]}"
+        correlation_id = f"corr_{uuid.uuid4().hex[:12]}"
+        self.runtime_context.update(task_id=task_id, interruption_state="none", agent_state="UNDERSTANDING")
+        self.events.set_context(task_id=task_id, correlation_id=correlation_id)
+        self.emit("task.created", task_id=task_id, correlation_id=correlation_id, raw_input=instruction)
         self.emit("voice.transcript", text=instruction)
         workflow_plan = self.workflow_orchestrator.plan(instruction)
         if workflow_plan.get("workflow"):
@@ -1187,14 +1202,17 @@ class LocalInstructionAgent:
         steps = self._try_local_model_plan(prompt) or self._split_steps(prompt)
         results = []
         self.emit("task.started", instruction=prompt, step_count=len(steps))
+        self.runtime_context.update(agent_state="EXECUTING")
 
         for step in steps:
             if self._interrupt_event.is_set():
+                self.runtime_context.update(agent_state="INTERRUPTED", interruption_state="requested")
                 self.emit("task.interrupted", reason="user_stop")
                 return {"status": "interrupted", "results": results, "execution_log": self.execution_log[-10:]}
             try:
                 parsed = self.parse_instruction(step)
                 action = parsed["action"]
+                self.runtime_context.update(previous_action=self.runtime_context.current_action, current_action=action)
                 self.emit("action.started", action=action, instruction=step)
 
                 if action == "screenshot":
@@ -1229,6 +1247,7 @@ class LocalInstructionAgent:
             "execution_log": self.execution_log[-10:],
         }
         self.emit("task.completed", status=response["status"])
+        self.runtime_context.update(agent_state="IDLE", interruption_state="none")
         return response
 
     def listen_voice_command(self, timeout: int = 10) -> Dict[str, Any]:

@@ -513,7 +513,17 @@ class UnifiedExecutionCore:
         dry_run: bool = False,
     ) -> Dict[str, Any]:
         """Run one policy-controlled desktop action through the core lifecycle."""
-        action = create_desktop_action(category, operation, parameters, expected_state, risk_level)
+        task_id = f"task_{uuid.uuid4().hex[:12]}"
+        correlation_id = f"corr_{uuid.uuid4().hex[:12]}"
+        action = create_desktop_action(
+            category,
+            operation,
+            parameters,
+            expected_state,
+            risk_level,
+            task_id=task_id,
+            correlation_id=correlation_id,
+        )
         action_name = f"{category}.{operation}"
         task_id = self.task_memory.create_task(
             task=action_name,
@@ -522,6 +532,8 @@ class UnifiedExecutionCore:
             plan=[{"category": category, "operation": operation}],
         )
         self.task_memory.record_action(task_id, {"action": action_name, "input": parameters or {}, "phase": ExecutionPhase.EXECUTION.value})
+        if hasattr(self.desktop_agent, "events"):
+            self.desktop_agent.events.set_context(task_id=task_id, correlation_id=correlation_id)
         context = {
             "action_type": ActionType.DESKTOP_CONTROL.value,
             "blast_radius": "high" if risk_level in {"high", "critical"} else "low",
