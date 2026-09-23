@@ -10,7 +10,10 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
+from action_schema import ActionTool
 from desktop_agent import LocalInstructionAgent
+from recovery_engine import RecoveryEngine
+from tanglish_nlp import IntentActionMapper, TanglishNormalizer
 
 
 class ExecutionPhase(str, Enum):
@@ -190,22 +193,6 @@ class Verifier:
         return True, "verified", {"verified_at": datetime.now().isoformat()}
 
 
-class RecoveryHandler:
-    def __init__(self):
-        self.failed_executions: List[Dict[str, Any]] = []
-
-    async def handle_failure(self, execution_id: str, phase: str, error: str) -> Dict[str, Any]:
-        recovery = {
-            "execution_id": execution_id,
-            "failed_at": phase,
-            "error": error,
-            "recovery_actions": ["retry_with_corrected_input" if phase == ExecutionPhase.VALIDATION.value else "inspect_and_retry"],
-            "timestamp": datetime.now().isoformat(),
-        }
-        self.failed_executions.append(recovery)
-        return recovery
-
-
 class UnifiedExecutionCore:
     """Single guarded pipeline backed by the existing real desktop executor."""
 
@@ -217,7 +204,7 @@ class UnifiedExecutionCore:
         self.verifier = Verifier()
         self.memory = UnifiedMemory()
         self.audit = UnifiedAuditLog()
-        self.recovery = RecoveryHandler()
+        self.recovery = RecoveryEngine(self.desktop_agent)
         self.execution_history: Dict[str, Dict[str, Any]] = {}
 
     async def execute_action(self, action: str, input_data: Dict[str, Any], context: Optional[Dict[str, Any]] = None, dry_run: bool = False) -> Dict[str, Any]:
@@ -237,17 +224,40 @@ class UnifiedExecutionCore:
             instruction = self._action_to_instruction(action, input_data)
             if instruction is None:
                 return self._response(execution_id, "failed", f"unsupported_action: {action}", ExecutionPhase.VALIDATION, blast)
-            result = self.desktop_agent.execute_instruction(instruction, allow_desktop_control=True, dry_run=dry_run, consent=True)
-            observation = await self.observer.observe(result, action)
-            if observation["is_anomaly"]:
-                recovery = await self.recovery.handle_failure(execution_id, ExecutionPhase.OBSERVATION.value, result.get("error", "action_not_completed"))
-                return self._response(execution_id, "failed", "observation_failed", ExecutionPhase.OBSERVATION, blast, recovery=recovery, data=result)
+            before_screen = None
+            expected = context.get("expected_outcome") or {}
+            if not dry_run and not expected:
+                return self._response(execution_id, "failed", "expected_state_required", ExecutionPhase.VALIDATION, blast)
+            has_real_expectation = any(key in expected for key in ("window", "text", "screen_changed"))
+            if not dry_run and not has_real_expectation:
+                return self._response(execution_id, "failed", "real_expected_state_required", ExecutionPhase.VALIDATION, blast)
+            if not dry_run and has_real_expectation:
+                before_screen = self.desktop_agent.observer.screenshot("before")
 
-            expected = context.get("expected_outcome", {"status": "completed"})
+            result = self.desktop_agent.execute_instruction(instruction, allow_desktop_control=True, dry_run=dry_run, consent=True)
+            if not dry_run and has_real_expectation:
+                real_verification = self.desktop_agent.verify_action(
+                    result,
+                    expected,
+                    before_screen,
+                    timeout=context.get("verification_timeout", 10.0),
+                )
+                observation = await self.observer.observe(real_verification.get("action", result), action)
+                if real_verification.get("status") != "VERIFIED":
+                    failure_reason = real_verification.get("verification", {}).get("reason", "real_observer_failed")
+                    recovery = self.recovery.recover(action, input_data, expected, failure_reason, execution_id, dry_run)
+                    return self._recovery_response(execution_id, action, input_data, result, recovery, blast, real_verification)
+            else:
+                observation = await self.observer.observe(result, action)
+            if observation["is_anomaly"]:
+                failure_reason = result.get("error", "action_not_completed")
+                recovery = self.recovery.recover(action, input_data, expected, failure_reason, execution_id, dry_run)
+                return self._recovery_response(execution_id, action, input_data, result, recovery, blast, result)
+
             verified, verify_reason, verification = await self.verifier.verify(result, expected)
             if not verified:
-                recovery = await self.recovery.handle_failure(execution_id, ExecutionPhase.VERIFICATION.value, verify_reason)
-                return self._response(execution_id, "failed", f"verification_failed: {verify_reason}", ExecutionPhase.VERIFICATION, blast, recovery=recovery, data=result)
+                recovery = self.recovery.recover(action, input_data, expected, verify_reason, execution_id, dry_run)
+                return self._recovery_response(execution_id, action, input_data, result, recovery, blast, result)
 
             memory_key = f"execution:{execution_id}:{action}"
             self.memory.store(memory_key, json.dumps(result, default=str), self.identity.agent_id, "trusted")
@@ -255,8 +265,126 @@ class UnifiedExecutionCore:
             self.execution_history[execution_id] = {"execution_id": execution_id, "action": action, "result": result, "observation": observation, "verification": verification}
             return self._response(execution_id, "completed", "success", ExecutionPhase.COMPLETED, blast, data=result)
         except Exception as exc:
-            recovery = await self.recovery.handle_failure(execution_id, ExecutionPhase.EXECUTION.value, str(exc))
-            return self._response(execution_id, "failed", str(exc), ExecutionPhase.FAILED, context["blast_radius"], recovery=recovery)
+            return self._response(execution_id, "failed", str(exc), ExecutionPhase.FAILED, context["blast_radius"])
+
+    def _recovery_response(
+        self,
+        execution_id: str,
+        action: str,
+        input_data: Dict[str, Any],
+        result: Dict[str, Any],
+        recovery: Dict[str, Any],
+        blast: str,
+        data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if recovery.get("recovered"):
+            self.audit.log(
+                self.identity.agent_id,
+                ExecutionPhase.RECOVERY.value,
+                action,
+                "recovered",
+                blast,
+                input_data,
+                recovery,
+            )
+            memory_key = f"execution:{execution_id}:{action}"
+            self.memory.store(
+                memory_key,
+                json.dumps(recovery, default=str),
+                self.identity.agent_id,
+                "verified",
+            )
+            self.execution_history[execution_id] = {
+                "execution_id": execution_id,
+                "action": action,
+                "result": result,
+                "recovery": recovery,
+                "status": "recovered",
+            }
+            return self._response(
+                execution_id,
+                "completed",
+                "action_recovered",
+                ExecutionPhase.RECOVERY,
+                blast,
+                data=recovery,
+                recovery=recovery,
+            )
+
+        return self._response(
+            execution_id,
+            "failed",
+            recovery.get("message", "recovery_failed"),
+            ExecutionPhase.FAILED,
+            blast,
+            data=data,
+            recovery=recovery,
+        )
+
+    async def execute_tool(self, tool: ActionTool, dry_run: bool = False) -> Dict[str, Any]:
+        """Execute a schema-defined action with verification-aware retries."""
+        validation = tool.validate()
+        if not validation["valid"]:
+            return {"status": "failed", "message": validation["reason"]}
+
+        action_map = {
+            "OPEN_APP": "open_app",
+            "TYPE_TEXT": "type_text",
+            "CLICK": "click_at",
+            "OPEN_URL": "open_url",
+        }
+        action = action_map.get(tool.action_id)
+        if action is None:
+            return {"status": "failed", "message": f"unsupported_action: {tool.action_id}"}
+
+        last_result: Dict[str, Any] = {}
+        attempts = tool.retry_policy.max_retries + 1
+        for attempt in range(attempts):
+            context = {
+                "blast_radius": tool.metadata.get("blast_radius", "low"),
+                "risk_level": tool.risk_level,
+                "expected_outcome": tool.expected_state.to_dict(),
+                "verification_timeout": tool.timeout,
+                "retry_attempt": attempt,
+            }
+            last_result = await self.execute_action(action, tool.parameters, context=context, dry_run=dry_run)
+            if last_result.get("status") in {"completed", "dry_run"}:
+                last_result.setdefault("data", {})
+                last_result["data"]["action_tool"] = tool.to_dict()
+                return last_result
+            if attempt < attempts - 1:
+                import asyncio
+                await asyncio.sleep(tool.retry_policy.retry_delay)
+        return last_result
+
+    async def execute_user_command(self, user_input: str, dry_run: bool = False) -> Dict[str, Any]:
+        """Normalize a user command, then execute it through the guarded core."""
+        normalizer = getattr(self.desktop_agent, "tanglish_nlp", None)
+        normalizer = normalizer or TanglishNormalizer()
+        intent = normalizer.normalize(user_input)
+        if intent.get("needs_clarification") or intent.get("intent") == "UNKNOWN":
+            return {
+                "status": "clarification_required",
+                "message": intent.get("clarification_reason", "Command is ambiguous"),
+                "intent": intent,
+            }
+
+        mapped = IntentActionMapper.to_action(intent)
+        if not mapped.get("action"):
+            return {
+                "status": "clarification_required",
+                "message": mapped.get("error", "Command cannot be mapped safely"),
+                "intent": intent,
+            }
+
+        result = await self.execute_action(
+            mapped["action"],
+            mapped["input_data"],
+            context={"expected_outcome": mapped["expected_outcome"]},
+            dry_run=dry_run,
+        )
+        result["intent"] = intent
+        return result
 
     @staticmethod
     def _action_to_instruction(action: str, data: Dict[str, Any]) -> Optional[str]:
@@ -272,6 +400,8 @@ class UnifiedExecutionCore:
             return f"press {data.get('key', '')}"
         if action == "search_web":
             return f"search web {data.get('query', '')}"
+        if action == "open_url":
+            return f"open url {data.get('url', '')}"
         return None
 
     def _response(self, execution_id: str, status: str, message: str, phase: ExecutionPhase, blast: str, data: Optional[Dict[str, Any]] = None, recovery: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

@@ -19,10 +19,14 @@ import shutil
 import subprocess
 import time
 import threading
+import webbrowser
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pyautogui
+from real_observer import RealObserver
+from tanglish_nlp import TanglishNormalizer
+from verification_engine import VerificationEngine
 
 try:
     import pyttsx3  # type: ignore
@@ -329,12 +333,18 @@ class LocalInstructionAgent:
         self.permission_guard = permission_guard
         self.local_consent = True
         self.local_model = local_model
+        self.tanglish_nlp = TanglishNormalizer(
+            llm_client=self._call_local_llm,
+            model=self.local_model,
+        )
         self.guard = SentinelGuard(admin_mode=admin_mode)
         self.voice = VoiceInput()
         self.overlay = SimpleOverlay()
         self.execution_log: List[Dict[str, Any]] = []
         self.capture_dir = os.path.join(os.getcwd(), "captures")
         os.makedirs(self.capture_dir, exist_ok=True)
+        self.observer = RealObserver(self.capture_dir)
+        self.verification_engine = VerificationEngine(self.observer)
         self.screen_access_active = False
         self.screen_context_path: Optional[str] = None
         self.screen_size: Optional[Dict[str, int]] = None
@@ -420,6 +430,45 @@ class LocalInstructionAgent:
     def speak(self, text: str) -> Dict[str, Any]:
         return self.voice.speak(text)
 
+    def verify_action(
+        self,
+        action_result: Dict[str, Any],
+        expected: Dict[str, Any],
+        before_screen: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Verify an action against the real desktop state."""
+        if action_result.get("status") not in {"completed", "success"}:
+            return {
+                "status": "FAILURE",
+                "reason": "Action itself failed",
+                "action_result": action_result,
+            }
+
+        verification = self.verification_engine.verify(
+            action=self._verification_action(expected, timeout),
+            before_screen=before_screen,
+        )
+        return {
+            "status": verification["status"],
+            "action": action_result,
+            "verification": verification,
+        }
+
+    @staticmethod
+    def _verification_action(expected: Dict[str, Any], timeout: float = 10.0):
+        from action_schema import ActionTool, ExpectedState
+
+        return ActionTool(
+            action_id="VERIFY_ACTION",
+            expected_state=ExpectedState(
+                window=expected.get("window"),
+                text=expected.get("text"),
+                screen_changed=expected.get("screen_changed", False),
+            ),
+            timeout=timeout,
+        )
+
     def execute_from_overlay(self, instruction: str) -> Dict[str, Any]:
         if not instruction or not instruction.strip():
             return {"status": "failed", "error": "empty instruction"}
@@ -427,6 +476,15 @@ class LocalInstructionAgent:
         result = self.execute_instruction(instruction, allow_desktop_control=True, consent=True)
         self.speak(f"Command finished with status {result.get('status', 'unknown')}")
         return result
+
+    def normalize_user_command(self, user_input: str) -> Dict[str, Any]:
+        """Normalize English or Tanglish input without executing desktop actions."""
+        intent = self.tanglish_nlp.normalize(user_input)
+        return {
+            "status": "completed",
+            "raw_input": user_input,
+            "intent": intent,
+        }
 
     def execute_voice_command(self, timeout: int = 10) -> Dict[str, Any]:
         """Listen once and execute the recognized instruction through the guard."""
@@ -558,6 +616,22 @@ class LocalInstructionAgent:
         self._log("search_web", "completed", {"query": query})
         return {"status": "completed", "query": query}
 
+    def open_url(self, url: str, dry_run: bool = False) -> Dict[str, Any]:
+        if not dry_run and not self.allow_desktop_control:
+            return {"status": "blocked", "reason": "desktop control is disabled"}
+
+        url = url.strip()
+        if not url:
+            return {"status": "failed", "error": "url is required"}
+        if not re.match(r"^https?://", url, re.IGNORECASE):
+            url = f"https://{url}"
+        if dry_run:
+            return {"status": "dry_run", "url": url}
+
+        webbrowser.open(url)
+        self._log("open_url", "completed", {"url": url})
+        return {"status": "completed", "url": url}
+
     def _recover_pointer_from_corner(self) -> None:
         """Move the pointer out of PyAutoGUI's emergency corner without disabling fail-safe."""
         x, y = pyautogui.position()
@@ -597,6 +671,10 @@ class LocalInstructionAgent:
 
         if re.search(r"\b(screenshot|screen shot|capture screen)\b", lowered):
             return {"action": "screenshot"}
+
+        match_url = re.search(r"\bopen\s+url(?:\s*:\s*|\s+)(https?://\S+)", text, re.IGNORECASE)
+        if match_url:
+            return {"action": "open_url", "value": match_url.group(1).strip().strip('"\'')}
 
         match_open = re.search(r"\bopen\s+(?:the\s+)?(?:app\s*:\s*|app\s+)?(.+)", text, re.IGNORECASE)
         if match_open:
@@ -670,6 +748,30 @@ class LocalInstructionAgent:
             return result
         except Exception as exc:  # pragma: no cover
             return {"status": "failed", "error": str(exc)}
+
+    def _call_local_llm(self, prompt: str) -> Optional[str]:
+        """Return a local model response for structured NLP normalization."""
+        if ollama is not None:
+            try:
+                response = ollama.generate(model=self.local_model, prompt=prompt)
+                return response.get("response", "")
+            except Exception:
+                pass
+
+        if requests is None:
+            return None
+
+        try:
+            response = requests.post(
+                "http://localhost:11434/api/generate",
+                json={"model": self.local_model, "prompt": prompt, "stream": False},
+                timeout=3,
+            )
+            if response.status_code == 200:
+                return response.json().get("response", "")
+        except Exception:
+            pass
+        return None
 
     def _try_local_model_plan(self, prompt: str) -> Optional[List[str]]:
         planning_prompt = (
@@ -852,6 +954,8 @@ class LocalInstructionAgent:
                     result = self.type_text(parsed["value"], dry_run=dry_run)
                 elif action == "search_web":
                     result = self.search_web(parsed["value"], dry_run=dry_run)
+                elif action == "open_url":
+                    result = self.open_url(parsed["value"], dry_run=dry_run)
                 elif action == "press_key":
                     result = self.press_key(parsed["value"], dry_run=dry_run)
                 elif action == "wait":
