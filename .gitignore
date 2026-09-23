@@ -8,5 +8,6 @@ captures/
 audit.db
 unified_memory.db
 unified_audit.db
+task_memory.db
 .env
 .DS_Store

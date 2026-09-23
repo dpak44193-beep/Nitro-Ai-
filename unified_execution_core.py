@@ -15,6 +15,7 @@ from action_schema import ActionTool
 from desktop_control import DesktopControl, create_desktop_action
 from desktop_agent import LocalInstructionAgent
 from recovery_engine import RecoveryEngine
+from task_memory import TaskMemory
 from tanglish_nlp import IntentActionMapper, TanglishNormalizer
 
 
@@ -206,6 +207,7 @@ class UnifiedExecutionCore:
         self.observer = Observer()
         self.verifier = Verifier()
         self.memory = UnifiedMemory()
+        self.task_memory = TaskMemory()
         self.audit = UnifiedAuditLog()
         self.recovery = RecoveryEngine(self.desktop_agent)
         self.execution_history: Dict[str, Dict[str, Any]] = {}
@@ -213,6 +215,13 @@ class UnifiedExecutionCore:
     async def execute_action(self, action: str, input_data: Dict[str, Any], context: Optional[Dict[str, Any]] = None, dry_run: bool = False) -> Dict[str, Any]:
         execution_id = str(uuid.uuid4())[:16]
         context = dict(context or {})
+        task_id = self.task_memory.create_task(
+            task=action,
+            normalized_task=context.get("normalized_task", action.lower()),
+            input_data=input_data,
+            plan=context.get("plan", []),
+        )
+        self.task_memory.record_action(task_id, {"action": action, "input": input_data, "phase": ExecutionPhase.EXECUTION.value})
         context.setdefault("action_type", ActionType.DESKTOP_CONTROL.value)
         context.setdefault("blast_radius", "low")
         self.audit.log(self.identity.agent_id, ExecutionPhase.AUTHENTICATION.value, action, "checking", input_data=input_data)
@@ -238,6 +247,7 @@ class UnifiedExecutionCore:
                 before_screen = self.desktop_agent.observer.screenshot("before")
 
             result = self.desktop_agent.execute_instruction(instruction, allow_desktop_control=True, dry_run=dry_run, consent=True)
+            self.task_memory.record_result(task_id, result)
             if not dry_run and has_real_expectation:
                 real_verification = self.desktop_agent.verify_action(
                     result,
@@ -249,25 +259,29 @@ class UnifiedExecutionCore:
                 if real_verification.get("status") != "VERIFIED":
                     failure_reason = real_verification.get("verification", {}).get("reason", "real_observer_failed")
                     recovery = self.recovery.recover(action, input_data, expected, failure_reason, execution_id, dry_run)
-                    return self._recovery_response(execution_id, action, input_data, result, recovery, blast, real_verification)
+                    return self._recovery_response(execution_id, action, input_data, result, recovery, blast, real_verification, task_id)
             else:
                 observation = await self.observer.observe(result, action)
             if observation["is_anomaly"]:
                 failure_reason = result.get("error", "action_not_completed")
                 recovery = self.recovery.recover(action, input_data, expected, failure_reason, execution_id, dry_run)
-                return self._recovery_response(execution_id, action, input_data, result, recovery, blast, result)
+                return self._recovery_response(execution_id, action, input_data, result, recovery, blast, result, task_id)
 
             verified, verify_reason, verification = await self.verifier.verify(result, expected)
             if not verified:
                 recovery = self.recovery.recover(action, input_data, expected, verify_reason, execution_id, dry_run)
-                return self._recovery_response(execution_id, action, input_data, result, recovery, blast, result)
+                return self._recovery_response(execution_id, action, input_data, result, recovery, blast, result, task_id)
 
             memory_key = f"execution:{execution_id}:{action}"
             self.memory.store(memory_key, json.dumps(result, default=str), self.identity.agent_id, "trusted")
             self.audit.log(self.identity.agent_id, ExecutionPhase.COMPLETED.value, action, "completed", blast, input_data, result)
+            self.task_memory.record_result(task_id, result, verification)
+            self.task_memory.complete_task(task_id, "SUCCESS", "direct_execution")
             self.execution_history[execution_id] = {"execution_id": execution_id, "action": action, "result": result, "observation": observation, "verification": verification}
             return self._response(execution_id, "completed", "success", ExecutionPhase.COMPLETED, blast, data=result)
         except Exception as exc:
+            self.task_memory.record_failure(task_id, {"reason": str(exc), "phase": ExecutionPhase.EXECUTION.value})
+            self.task_memory.complete_task(task_id, "FAILED", "direct_execution")
             return self._response(execution_id, "failed", str(exc), ExecutionPhase.FAILED, context["blast_radius"])
 
     def _recovery_response(
@@ -279,7 +293,15 @@ class UnifiedExecutionCore:
         recovery: Dict[str, Any],
         blast: str,
         data: Dict[str, Any],
+        task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if task_id:
+            self.task_memory.record_recovery(task_id, recovery)
+            if recovery.get("recovered"):
+                self.task_memory.complete_task(task_id, "RECOVERED", recovery.get("strategy", "recovery"))
+            else:
+                self.task_memory.record_failure(task_id, {"reason": recovery.get("message", "recovery_failed"), "phase": ExecutionPhase.RECOVERY.value})
+                self.task_memory.complete_task(task_id, "FAILED", "recovery")
         if recovery.get("recovered"):
             self.audit.log(
                 self.identity.agent_id,
@@ -383,11 +405,22 @@ class UnifiedExecutionCore:
         result = await self.execute_action(
             mapped["action"],
             mapped["input_data"],
-            context={"expected_outcome": mapped["expected_outcome"]},
+            context={"expected_outcome": mapped["expected_outcome"], "normalized_task": intent.get("normalized_input", user_input)},
             dry_run=dry_run,
         )
         result["intent"] = intent
         return result
+
+    def retrieve_task_memory(self, task: str) -> Dict[str, Any]:
+        """Return prior successes and failures as recommendations, not commands."""
+        successful = self.task_memory.find_successful_method(task)
+        failures = self.task_memory.find_previous_failures(task)
+        return {
+            "successful_method": successful,
+            "previous_failures": failures,
+            "has_previous_success": successful is not None,
+            "has_previous_failures": bool(failures),
+        }
 
     async def execute_desktop_action(
         self,
@@ -402,6 +435,13 @@ class UnifiedExecutionCore:
         """Run one policy-controlled desktop action through the core lifecycle."""
         action = create_desktop_action(category, operation, parameters, expected_state, risk_level)
         action_name = f"{category}.{operation}"
+        task_id = self.task_memory.create_task(
+            task=action_name,
+            normalized_task=action_name,
+            input_data=parameters or {},
+            plan=[{"category": category, "operation": operation}],
+        )
+        self.task_memory.record_action(task_id, {"action": action_name, "input": parameters or {}, "phase": ExecutionPhase.EXECUTION.value})
         context = {
             "action_type": ActionType.DESKTOP_CONTROL.value,
             "blast_radius": "high" if risk_level in {"high", "critical"} else "low",
@@ -416,6 +456,8 @@ class UnifiedExecutionCore:
                 blast,
                 details=reason,
             )
+            self.task_memory.record_failure(task_id, {"reason": reason, "phase": ExecutionPhase.AUTHORIZATION.value})
+            self.task_memory.complete_task(task_id, "FAILED", "policy")
             return {"status": "denied", "action_id": action.action_id, "reason": reason, "phase": ExecutionPhase.AUTHORIZATION.value}
         self.audit.log(
             self.identity.agent_id,
@@ -430,6 +472,7 @@ class UnifiedExecutionCore:
             explicit_permission,
             dry_run,
         )
+        self.task_memory.record_result(task_id, result)
         observation = await self.observer.observe(result, action_name)
         if observation["is_anomaly"]:
             recovery = self.recovery.recover(
@@ -440,6 +483,8 @@ class UnifiedExecutionCore:
                 execution_id=action.action_id,
                 dry_run=dry_run,
             )
+            self.task_memory.record_recovery(task_id, recovery)
+            self.task_memory.complete_task(task_id, "RECOVERED" if recovery.get("recovered") else "FAILED", recovery.get("strategy", "recovery"))
             return {"status": "failed", "action_id": action.action_id, "reason": "observation_failed", "recovery": recovery, "data": result}
 
         verification: Dict[str, Any] = {"status": "VERIFIED", "expected_state": expected_state or {}, "verified_at": datetime.now().isoformat()}
@@ -461,6 +506,8 @@ class UnifiedExecutionCore:
                     execution_id=action.action_id,
                     dry_run=dry_run,
                 )
+                self.task_memory.record_recovery(task_id, recovery)
+                self.task_memory.complete_task(task_id, "RECOVERED" if recovery.get("recovered") else "FAILED", recovery.get("strategy", "recovery"))
                 return {"status": "failed", "action_id": action.action_id, "reason": "verification_failed", "verification": verification, "recovery": recovery}
 
         self.audit.log(
@@ -470,6 +517,8 @@ class UnifiedExecutionCore:
             "completed",
             details=json.dumps({"action_id": action.action_id, "verification": verification}, default=str),
         )
+        self.task_memory.record_result(task_id, result, verification)
+        self.task_memory.complete_task(task_id, "SUCCESS", f"{category}.{operation}")
         return {"status": "completed", "action_id": action.action_id, "category": category, "operation": operation, "result": result, "verification": verification}
 
     @staticmethod
